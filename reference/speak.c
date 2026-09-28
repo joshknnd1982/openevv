@@ -54,6 +54,32 @@ ECIHand __stdcall eciNewEx(unsigned);
 int __stdcall eciSpeaking(ECIHand);
 int __stdcall eciInsertIndex(ECIHand, int);
 
+/* The filter interface, which the s mode below uses. What a caller gets
+   back about a filter is its own name and the language it answers for,
+   both written by the manager rather than by the caller. */
+typedef struct ECIFilterAttrib {
+    char eciFilterName[80];
+    long language;
+} ECIFilterAttrib;
+
+typedef int (__stdcall *PGETFILTEROBJECT)(unsigned long which, void **out);
+
+int __stdcall eciRegisterFilter(ECIHand, unsigned int, PGETFILTEROBJECT *,
+                                ECIFilterAttrib *, int);
+void *__stdcall eciNewFilter(ECIHand, unsigned int, int);
+int __stdcall eciActivateFilter(ECIHand, void *);
+int __stdcall eciGetFilteredText(ECIHand, void *, const void *,
+                                 const void **);
+
+/* IBM's own SSML filter, which nothing in its objects reaches. Its entry
+   point is compiled cdecl where the pointer registerFilter takes is
+   stdcall, so the two disagree about who takes the two arguments back off
+   the stack. The eight bytes leak until registerFilter returns and its own
+   frame pointer recovers them, and nothing in between touches the stack
+   pointer, which is why the original gets away with it. The cast is what
+   says so. */
+int ssmlFilterGetObject(unsigned long which, void **out);
+
 void evvRunStaticInitialisers(void);
 
 #define FRAME 2048
@@ -189,7 +215,20 @@ int main(int argc, char **argv)
         for (i = 0; i < n && i < 32; i++)
             printf("speak:   language 0x%x\n", langs[i]);
 
-        h = eciNew();
+        /* Which language to make the instance for. eciNew is not the same
+           as eciNewEx with the only language a module has: for Japanese it
+           answers an instance that speaks nothing at all, because the
+           language handed over at creation is what carries the codeset. So
+           the variable cli/probe.c already reads is read here too, and both
+           sides make the instance the same way. */
+        {
+            const char *want = getenv("EVV_LANGUAGE");
+
+            if (want != NULL && *want != 0)
+                h = eciNewEx((unsigned)strtoul(want, NULL, 0));
+            else
+                h = eciNew();
+        }
         if (h == NULL && n > 0)
             h = eciNewEx(langs[0]);
         if (h == NULL)
@@ -237,6 +276,44 @@ int main(int argc, char **argv)
         printf("speak: deleteDict %d\n", eciDeleteDict(h, dict));
     }
 
+    /* An s reads the text as SSML before speaking it. The filter is in
+       these objects and nothing in them registers it, so this does what a
+       caller would. Combine it with an a, since what the reader produces is
+       annotations and the engine only reads those with the annotation input
+       type on. */
+    if (argc > 3 && strchr(argv[3], 's')) {
+        ECIFilterAttrib attrib;
+        PGETFILTEROBJECT entry = (PGETFILTEROBJECT)ssmlFilterGetObject;
+        void *filter;
+
+        memset(&attrib, 0, sizeof attrib);
+        printf("speak: registerFilter %d [%s] language 0x%x\n",
+               eciRegisterFilter(h, 0, &entry, &attrib, 1),
+               attrib.eciFilterName, (unsigned)attrib.language);
+
+        filter = eciNewFilter(h, 0, 1);
+        printf("speak: newFilter %s\n", filter ? "made" : "refused");
+        if (filter != NULL) {
+            const void *filtered = NULL;
+            char *writable = malloc(strlen(text) + 1);
+
+            printf("speak: activateFilter %d\n",
+                   eciActivateFilter(h, filter));
+            /* The reader writes a NUL into the text it is given where a
+               numeric character reference ends, so it gets a copy it may
+               write on rather than the literal. */
+            if (writable != NULL) {
+                strcpy(writable, text);
+                printf("speak: getFilteredText %d\n",
+                       eciGetFilteredText(h, filter, writable, &filtered));
+            }
+            if (filtered != NULL) {
+                text = (const char *)filtered;
+                printf("speak: filtered [%s]\n", text);
+            }
+        }
+    }
+
     /* An index mark in the middle of the text, so that the path that
        reports one back is walked at all. */
     if (!eciInsertIndex(h, 4242))
@@ -282,6 +359,39 @@ int main(int argc, char **argv)
 
     write_wav(out, 11025);
     printf("speak: wrote %s\n", out);
+
+    /* A t says the same thing again on the same instance and writes it
+       beside the first, which is the only way to ask whether the engine
+       repeats itself. Ours does not; the question is whether IBM's does,
+       because every case the suite compares is the first utterance of a
+       fresh process and a second one has never been held against anything. */
+    if (argc > 3 && strchr(argv[3], 't')) {
+        char again[1024];
+        size_t first = nsamples;
+
+        snprintf(again, sizeof again, "%s.again.wav", out);
+        nsamples = 0;
+        if (!eciAddText(h, text) || !eciSynthesize(h))
+            printf("speak: the second utterance was refused\n");
+        else {
+            /* Pumped the same way the first one is: asking whether it is
+               still speaking is what drains the queue, and synchronizeSynth
+               does nothing here. Driving the two differently is what made
+               the first attempt at this say the engine had gone silent. */
+            int i;
+
+            for (i = 0; i < 3000 && eciSpeaking(h); i++)
+                Sleep(10);
+            printf("speak: %lu samples the second time\n",
+                   (unsigned long)nsamples);
+            if (nsamples != 0) {
+                write_wav(again, 11025);
+                printf("speak: wrote %s\n", again);
+            }
+        }
+        printf("speak: first %lu, second %lu\n",
+               (unsigned long)first, (unsigned long)nsamples);
+    }
 
     eciDelete(h);
     return 0;

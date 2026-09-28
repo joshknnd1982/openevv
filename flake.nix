@@ -16,10 +16,15 @@
       };
     in {
       # `nix build' and `nix run'. The ordinary make, which wants a C
-      # compiler and nothing else, so this is the plain stdenv and no inputs.
+      # compiler and Python: the rules a build compiles are written out of the
+      # text in lang/<tag>/rules rather than kept beside it, and the default
+      # build decompiles them into C after that. Nothing else, so the plain
+      # stdenv otherwise.
       packages.${system}.default = pkgs.stdenv.mkDerivation {
         name = "openevv";
         src = self;
+
+        nativeBuildInputs = [ pkgs.python3 pkgs.makeWrapper ];
 
         # -no-pie is in the Makefile, where it belongs: the machine keeps host
         # addresses in thirty-two bit values, so the program has to sit low
@@ -30,8 +35,14 @@
         enableParallelBuilding = true;
         makeFlags = [ "PREFIX=${placeholder "out"}" ];
 
-        # No meta.license. What this may be licensed as is not settled: the
-        # engine is ours and the language data under lang is IBM's.
+        postFixup = ''
+          wrapProgram $out/bin/openevv-say \
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.pipewire pkgs.pulseaudio pkgs.alsa-utils ]}
+        '';
+
+        # No meta.license, deliberately. Our own work is MIT, but the language
+        # data under lang is IBM's, so the thing this derivation builds is not
+        # MIT as a whole. NOTICE says which is which.
         meta = {
           description = "IBM Embedded ViaVoice rebuilt as portable C";
           mainProgram = "evv";
@@ -51,7 +62,17 @@
           # MSVC-mangled and x86-only.
           pkgs.pkgsCross.mingw32.buildPackages.gcc
           pkgs.pkgsCross.mingw32.buildPackages.binutils
-          pkgs.wine
+
+          # Builds the Windows release: the same engine with src/port/port_win32.c
+          # standing in for the POSIX layer, linked static so what ships is one
+          # file.
+          pkgs.pkgsCross.mingwW64.buildPackages.gcc
+          pkgs.pkgsCross.mingwW64.buildPackages.binutils
+
+          # Wow64, because there are now two kinds of PE to run: the 32-bit
+          # reference the tests compare against, and our own 64-bit build.
+          # The 32-bit-only wine answers "Bad EXE format" to the second.
+          pkgs.wineWow64Packages.stable
 
           # The thirty-two bit build, which is a check rather than a target:
           # a difference between the word sizes is a layout mistake, and this
@@ -63,6 +84,17 @@
           pkgs.gcc
           pkgs.gnumake
           pkgs.python3
+
+          # The Speech Dispatcher output module compiles against Speech
+          # Dispatcher's own headers and links its out-of-tree module helper.
+          # Headers and a library, nothing else: the module hands its samples
+          # back to the server rather than opening a device, so building it
+          # here neither needs a running server nor touches one.
+          pkgs.speechd
+          pkgs.pkg-config
+          # speech-dispatcher.pc requires glib-2.0, so pkg-config cannot
+          # answer for it without glib's own .pc beside it.
+          pkgs.glib.dev
         ];
 
         shellHook = ''
@@ -72,6 +104,7 @@
           # rather than as a package because nixpkgs splicing would otherwise
           # substitute a native build of it.
           export MINGW_LDFLAGS="-L${pkgs.pkgsCross.mingw32.windows.mcfgthreads.outPath}/lib"
+          export MINGW64_LDFLAGS="-L${pkgs.pkgsCross.mingwW64.windows.mcfgthreads.outPath}/lib"
           export WINEPREFIX="$PWD/.wine"
           # Nothing under Wine plays audio here; keep it away from the sound
           # devices entirely.

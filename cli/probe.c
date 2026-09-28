@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include "evv_abi.h"
 
@@ -41,10 +44,19 @@ enum ECICallbackReturn {
 OldInst *STDCALL eo_new(void);
 OldInst *STDCALL eo_newEx(int32_t language);
 int      STDCALL es_delete(OldInst *h);
+int32_t  STDCALL es_registerFilter(OldInst *h, uint32_t id, void *entry,
+                                   void *attrib, int32_t autoload);
+void    *STDCALL es_newFilter(OldInst *h, int32_t id, int32_t global);
+int32_t  STDCALL es_activateFilter(OldInst *h, void *filter);
+int32_t  STDCALL es_getFilteredText(OldInst *h, void *filter, const void *in,
+                                    const void **out);
+extern STDCALL int ssml_getFilterObject(uint32_t which, void **out);
 int      STDCALL et_addText(OldInst *h, const char *text);
 int      STDCALL et_synthesize(OldInst *h);
 int      STDCALL et_insertIndex(OldInst *h, int32_t n);
 int      STDCALL ev_setOutputBuffer(OldInst *h, int32_t n, void *buf);
+int             ev_setOutputToPhonemeCallback(OldInst *h, int32_t n,
+                                              void *buf);
 int32_t  STDCALL ev_setParam(OldInst *h, int32_t which, int32_t value);
 int32_t  STDCALL eo_getParam(OldInst *h, int32_t which);
 int32_t  STDCALL vc_getVoiceParam(OldInst *h, int32_t voice, int32_t which);
@@ -65,8 +77,21 @@ void evv_port_finish(void);
 
 #define FRAME 2048
 
+/* What a caller registering a filter gets back: the filter's own name and
+   the language it answers for, both written by the manager rather than by
+   the caller. */
+typedef struct ECIFilterAttrib {
+    char    eciFilterName[80];
+    int32_t language;
+} ECIFilterAttrib;
+
 static short  frame[FRAME];
 static short *samples;
+/* Where the engine puts the phonemes it places when it is asked for those
+   rather than samples: each is a name packed into a word and a length in
+   milliseconds. */
+static int32_t phonemes[2048];
+static int     phonemes_wanted;
 static size_t nsamples;
 static size_t cap;
 
@@ -91,7 +116,28 @@ static enum ECICallbackReturn STDCALL on_message(OldInst *h,
     (void)h;
     (void)data;
 
-    if (msg == eciWaveformBuffer)
+    if (msg == eciPhonemeBuffer) {
+        /* The buffer holds what the language decided the words were made of,
+           as one annotation string -- `2 `[.2hE.1lo]`0 and so on -- and
+           param counts its characters. It was read here as pairs of a
+           four-character name and a duration until 9 September 2026, which
+           printed the string's own bytes as durations of hundreds of
+           millions of milliseconds. There are no durations in it: those go
+           to a phoneme callback the public interface does not reach, so
+           anything wanting the length of a phoneme has to time it against
+           the frames instead. */
+        long i;
+
+        printf("speak: phonemes ");
+        for (i = 0; i < param * (long)sizeof phonemes[0]; i++) {
+            char c = ((const char *)phonemes)[i];
+
+            if (c == 0)
+                break;
+            putchar(c);
+        }
+        putchar('\n');
+    } else if (msg == eciWaveformBuffer)
         keep(frame, (size_t)param);
     else if (msg == eciIndexReply)
         printf("speak: index %ld\n", param);
@@ -144,11 +190,15 @@ static void write_wav(const char *path, unsigned long rate)
 
 static void nap(long ms)
 {
+#if defined(_WIN32)
+    Sleep((unsigned long)(ms < 0 ? 0 : ms));
+#else
     struct timespec t;
 
     t.tv_sec = ms / 1000;
     t.tv_nsec = (ms % 1000) * 1000000L;
     nanosleep(&t, NULL);
+#endif
 }
 
 /* A case may hold bytes the command line cannot carry unchanged: Wine
@@ -206,7 +256,18 @@ int main(int argc, char **argv)
         for (i = 0; i < n && i < 32; i++)
             printf("speak:   language 0x%x\n", langs[i]);
 
-        h = eo_new();
+        /* A build may have more than one language in it, and the
+           tests want to drive each of them through the same binary.
+           EVV_LANGUAGE names which, as the number the API uses; with
+           nothing set the engine picks, which is the first one linked. */
+        {
+            const char *want = getenv("EVV_LANGUAGE");
+
+            if (want != NULL && *want != 0)
+                h = eo_newEx((uint32_t)strtoul(want, NULL, 0));
+            else
+                h = eo_new();
+        }
         if (h == NULL && n > 0)
             h = eo_newEx(langs[0]);
         if (h == NULL)
@@ -221,6 +282,34 @@ int main(int argc, char **argv)
     if (!ev_setOutputBuffer(h, FRAME, frame)) {
         printf("speak: setOutputBuffer refused\n");
         return 1;
+    }
+
+    /* A p asks for phonemes instead of sound: what the language decided the
+       words are made of, under the names its own statement table gives them.
+       Nothing is written to the wave file in that mode.
+     *
+     * It does not report anything yet, and what is missing is written down
+     * rather than guessed at. The engine places its phonemes -- placePhoneme
+     * in src/eci/bridge/eci_deltacb.c is reached, five times for one short word -- and
+     * returns at once because ELOQ_WANT_PHONEMES is nought. Registering the
+     * buffer sets the thread state, parameter four sets the flag through
+     * setPhonemeIndiciesRun, and something puts it back before the utterance:
+     * es_setCurrentState sends espr0 when the state says the engine is not in
+     * phoneme mode, and the text path sends the same on a fresh utterance.
+     * disptok, which spells a token and was an empty stub, is written now, so
+     * the names will be there when the flag stays. */
+    if (argc > 3 && strchr(argv[3], 'p')) {
+        if (!ev_setOutputToPhonemeCallback(h, (int32_t)(sizeof phonemes
+                                                        / sizeof phonemes[0]),
+                                           phonemes)) {
+            printf("speak: it would not report phonemes\n");
+            return 1;
+        }
+        /* And the parameter that says the caller wants to be told: without
+           it the engine places its phonemes and reports none of them. */
+        if (ev_setParam(h, 4, 1) < 0)
+            printf("speak: it would not report phoneme indices\n");
+        phonemes_wanted = 1;
     }
 
     if (argc > 3 && strchr(argv[3], 'a')) {
@@ -245,6 +334,44 @@ int main(int argc, char **argv)
         printf("speak: loadDict %d\n", ed_loadDict(h, dict, 0, "x"));
         printf("speak: setDict none %d\n", ed_setDict(h, NULL));
         printf("speak: deleteDict %d\n", ed_deleteDict(h, dict));
+    }
+
+    /* An s reads the text as SSML before speaking it, which is the only way
+       to reach the reader from here: the engine carries the filter and never
+       loads it by itself, so this registers it the way a caller would.
+       Combine it with an a, since what the reader produces is annotations
+       and the engine only reads those with the annotation input type on. */
+    if (argc > 3 && strchr(argv[3], 's')) {
+        ECIFilterAttrib attrib;
+        void *entry = (void *)ssml_getFilterObject;
+        void *filter;
+
+        memset(&attrib, 0, sizeof attrib);
+        printf("speak: registerFilter %d [%s] language 0x%x\n",
+               (int)es_registerFilter(h, 0, &entry, &attrib, 1),
+               attrib.eciFilterName, (unsigned)attrib.language);
+
+        filter = es_newFilter(h, 0, 1);
+        printf("speak: newFilter %s\n", filter ? "made" : "refused");
+        if (filter != NULL) {
+            const void *filtered = NULL;
+            char *writable = malloc(strlen(text) + 1);
+
+            printf("speak: activateFilter %d\n",
+                   (int)es_activateFilter(h, filter));
+            /* IBM's reader writes into the text it is given -- see
+               src/eci/ssml/eci_mbconvert.c -- so it gets a copy it may write on. */
+            if (writable != NULL) {
+                strcpy(writable, text);
+                printf("speak: getFilteredText %d\n",
+                       (int)es_getFilteredText(h, filter, writable,
+                                               &filtered));
+            }
+            if (filtered != NULL) {
+                text = (const char *)filtered;
+                printf("speak: filtered [%s]\n", text);
+            }
+        }
     }
 
     if (!et_insertIndex(h, 4242))
@@ -279,6 +406,36 @@ int main(int argc, char **argv)
     }
 
     eo_synchronizeSynth(h);
+    /* A t says the same thing again on the same instance and writes it beside
+       the first, which is what the reference's own t does, so the two can be
+       held against each other. Every case the suite compares is the first
+       utterance of a fresh process; this is how a second one gets compared. */
+    if (argc > 3 && strchr(argv[3], 't')) {
+        size_t first = nsamples;
+        char again[1024];
+        int i;
+
+        snprintf(again, sizeof again, "%s.again.wav", out);
+        write_wav(out, 11025);
+        printf("speak: %lu samples to %s\n", (unsigned long)nsamples, out);
+
+        nsamples = 0;
+        if (!et_addText(h, text) || !et_synthesize(h)) {
+            printf("speak: the second utterance was refused\n");
+        } else {
+            for (i = 0; i < 3000 && eo_speaking(h); i++)
+                nap(10);
+            write_wav(again, 11025);
+            printf("speak: %lu samples to %s\n",
+                   (unsigned long)nsamples, again);
+        }
+        printf("speak: first %lu, second %lu\n",
+               (unsigned long)first, (unsigned long)nsamples);
+        es_delete(h);
+        evv_port_finish();
+        return 0;
+    }
+
     es_delete(h);
     evv_port_finish();
 

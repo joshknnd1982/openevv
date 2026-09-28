@@ -15,7 +15,7 @@
 # the reference hangs now and again on an index mark, and calling that a
 # difference has cost false alarms.
 #
-# usage: compare.sh <cases-file> [mode-letters] [text-pattern]
+# usage: test/compare.sh <cases-file> [mode-letters] [text-pattern]
 
 set -u
 
@@ -23,32 +23,79 @@ LIMIT=${EVV_CASE_TIMEOUT:-120}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BUILD=$ROOT/build
 
-cases=${1:?usage: compare.sh <cases-file> [mode] [pattern]}
+cases=${1:?usage: test/compare.sh <cases-file> [mode] [pattern]}
 case $cases in /*) ;; *) cases=$PWD/$cases ;; esac
 [ -r "$cases" ] || { echo "compare: cannot read $cases" >&2; exit 2; }
 mode=${2:-}
 pattern=${3:-}
 
-[ -x "$BUILD/reference/speak.exe" ] || { echo "compare: no reference binary" >&2; exit 2; }
+# Both engines here may be Windows binaries. On Windows they run themselves;
+# anywhere else they want Wine in front of them. The reference always is one,
+# since it is IBM's own code built as IBM built it.
+case $(uname -s 2>/dev/null) in
+MINGW*|MSYS*|CYGWIN*) PE= ;;
+*)                    PE=wine ;;
+esac
+
+# Which language is being compared. A build takes one language, and so does
+# the reference built from that language's objects, so the two have to be
+# named together or an English engine gets held against a German oracle and
+# every case differs for no reason worth reading. English keeps the plain
+# names because that is what everything already asks for.
+LANG_TAG=${EVV_LANG:-enus}
+case $LANG_TAG in
+enus) SUF= ;;
+*)    SUF=-$LANG_TAG ;;
+esac
+
+# And which language to ask the engine for, since a build may have more than
+# one in it. These are IBM's own numbers, the ones its ini names each
+# language section for; a language added to the tree adds a line here.
+case $LANG_TAG in
+enus) : ${EVV_LANGUAGE:=0x10000} ;;
+dede) : ${EVV_LANGUAGE:=0x40000} ;;
+engb) : ${EVV_LANGUAGE:=0x10001} ;;
+eses) : ${EVV_LANGUAGE:=0x20000} ;;
+esus) : ${EVV_LANGUAGE:=0x20001} ;;
+itit) : ${EVV_LANGUAGE:=0x50000} ;;
+frfr) : ${EVV_LANGUAGE:=0x30000} ;;
+frca) : ${EVV_LANGUAGE:=0x30001} ;;
+jajp) : ${EVV_LANGUAGE:=0x80000} ;;
+esac
+export EVV_LANGUAGE
+
+REFDIR=${EVV_REFERENCE_DIR:-$BUILD/reference$SUF}
+[ -x "$REFDIR/speak.exe" ] || { echo "compare: no reference binary" >&2; exit 2; }
 # Which of ours to run. Both builds have to say the same thing, so either
 # can be set against the reference; EVV_NATIVE names the other one.
-OURS=${EVV_NATIVE:-$BUILD/probe}
+OURS=${EVV_NATIVE:-$BUILD/probe$SUF}
+# Each case is spoken from a directory of its own, so a name given relative
+# to here would not be found once there.
+case $OURS in
+/*) ;;
+*)  OURS=$PWD/$OURS ;;
+esac
 [ -x "$OURS" ] || { echo "compare: no native binary" >&2; exit 2; }
+# Ours may be the Windows build now, which runs the way the reference does.
+case $OURS in
+*.exe) OURS_RUN="$PE $OURS" ;;
+*)     OURS_RUN="$OURS" ;;
+esac
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-cp "$BUILD"/reference/*.exe "$work/" 2>/dev/null
+cp "$REFDIR"/*.exe "$work/" 2>/dev/null
 cd "$work"
 
 # One case through one binary. Answers 0 when it produced a file, 1 when it
 # timed out.
 one_run() {
     local who=$1 out=$2
-    rm -f "$out"
+    rm -f "$out" "$out.again.wav"
     if [ "$who" = ref ]; then
-        timeout "$LIMIT" wine ./speak.exe @case.txt "$out" $mode > "$out.txt" 2>/dev/null
+        timeout "$LIMIT" $PE ./speak.exe @case.txt "$out" $mode > "$out.txt" 2>/dev/null
     else
-        timeout "$LIMIT" "$OURS" @case.txt "$out" $mode > "$out.txt" 2>/dev/null
+        timeout "$LIMIT" $OURS_RUN @case.txt "$out" $mode > "$out.txt" 2>/dev/null
     fi
     [ -s "$out" ]
 }
@@ -69,6 +116,14 @@ while IFS= read -r text; do
 
     ok=yes
     cmp -s ref.wav nat.wav || ok=no
+    # A mode that says the text twice writes the second utterance beside the
+    # first, under a name of its own, and both engines do it. Comparing the
+    # first alone would say nothing about the thing that category is for --
+    # the machine's state has moved on by the second, and whether it has
+    # moved on the same way is the question.
+    if [ -s ref.wav.again.wav ] || [ -s nat.wav.again.wav ]; then
+        cmp -s ref.wav.again.wav nat.wav.again.wav || ok=no
+    fi
     # The reference writes its lines the way Windows does, so the carriage
     # returns come off before the two are set against each other.
     if [ -n "$pattern" ]; then
